@@ -2,33 +2,35 @@
 # Licensed under the MIT License.
 
 import os
-import re
 import random
+import re
 import shutil
 import warnings
-import pandas as pd
 from typing import Optional
 from zipfile import ZipFile
-from recommenders.datasets.download_utils import maybe_download, download_path
-from recommenders.utils.notebook_utils import is_databricks
+
+import pandas as pd
+
+from recommenders.datasets.download_utils import download_path, maybe_download
 from recommenders.utils.constants import (
+    DEFAULT_GENRE_COL,
     DEFAULT_HEADER,
     DEFAULT_ITEM_COL,
-    DEFAULT_USER_COL,
     DEFAULT_RATING_COL,
     DEFAULT_TIMESTAMP_COL,
     DEFAULT_TITLE_COL,
-    DEFAULT_GENRE_COL,
+    DEFAULT_USER_COL,
 )
+from recommenders.utils.notebook_utils import is_databricks
 
 try:
     from pyspark.sql.types import (
-        StructType,
-        StructField,
-        StringType,
-        IntegerType,
         FloatType,
+        IntegerType,
         LongType,
+        StringType,
+        StructField,
+        StructType,
     )
 except ImportError:
     pass  # so the environment without spark doesn't break
@@ -106,6 +108,14 @@ DATA_FORMAT = {
         "::", "ml-10M100K/ratings.dat", False, "::", "ml-10M100K/movies.dat", False
     ),
     "20m": _DataFormat(",", "ml-20m/ratings.csv", True, ",", "ml-20m/movies.csv", True),
+    "latest-small": _DataFormat(
+        ",",
+        "ml-latest-small/ratings.csv",
+        True,
+        ",",
+        "ml-latest-small/movies.csv",
+        True,
+    ),
 }
 
 # Fake data for testing only
@@ -144,7 +154,7 @@ WARNING_MOVIE_LENS_HEADER = """MovieLens rating dataset has four columns
 WARNING_HAVE_SCHEMA_AND_HEADER = """Both schema and header are provided.
     The header argument will be ignored."""
 ERROR_MOVIE_LENS_SIZE = (
-    "Invalid data size. Should be one of {100k, 1m, 10m, or 20m, or mock100}"
+    "Invalid data size. Should be one of {100k, 1m, 10m, 20m, latest-small, or mock100}"
 )
 ERROR_HEADER = "Header error. At least user and movie column names should be provided"
 
@@ -163,7 +173,7 @@ def load_pandas_df(
     To load movie information only, you can use load_item_df function.
 
     Args:
-        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "mock100").
+        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "latest-small", "mock100").
         header (list or tuple or None): Rating dataset header.
             If `size` is set to any of 'MOCK_DATA_FORMAT', this parameter is ignored and data is rendered using the 'DEFAULT_HEADER' instead.
         local_cache_path (str): Path (directory or a zip file) to cache the downloaded zip file.
@@ -262,7 +272,7 @@ def load_item_df(
     """Loads Movie info.
 
     Args:
-        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m").
+        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "latest-small").
         local_cache_path (str): Path (directory or a zip file) to cache the downloaded zip file.
             If None, all the intermediate files will be stored in a temporary directory and removed after use.
         movie_col (str): Movie id column name.
@@ -286,6 +296,124 @@ def load_item_df(
         )
 
     return item_df
+
+
+def load_links_df(
+    size="100k",
+    local_cache_path=None,
+    movie_col=DEFAULT_ITEM_COL,
+    imdb_col="imdbId",
+    tmdb_col="tmdbId",
+):
+    """Loads MovieLens links data containing movie IDs mapped to IMDb and TMDb IDs.
+
+    The links.csv file provides identifiers that can be used to link to other
+    sources of movie data like IMDb (http://www.imdb.com) and TMDb
+    (https://www.themoviedb.org).
+
+    Note: The links.csv file is only available in the 10m, 20m, and latest-small datasets.
+    The 100k and 1m datasets do not include this file.
+
+    Args:
+        size (str): Size of the data to load. One of ("10m", "20m", "latest-small").
+            Note: "100k" and "1m" do not contain links data.
+        local_cache_path (str): Path (directory or a zip file) to cache the downloaded zip file.
+            If None, all the intermediate files will be stored in a temporary directory and removed after use.
+        movie_col (str): Movie id column name.
+        imdb_col (str): IMDb id column name. If None, the column will not be loaded.
+        tmdb_col (str): TMDb id column name. If None, the column will not be loaded.
+
+    Returns:
+        pandas.DataFrame: Links data with movieId, imdbId, and tmdbId columns.
+
+    **Examples**
+
+    .. code-block:: python
+
+        # Load links data from MovieLens-10M dataset
+        links_df = load_links_df('10m')
+
+        # Load with custom column names
+        links_df = load_links_df('20m', movie_col='movieId', imdb_col='imdb', tmdb_col='tmdb')
+    """
+    size = size.lower()
+    if size not in DATA_FORMAT:
+        raise ValueError(f"Size: {size}. " + ERROR_MOVIE_LENS_SIZE)
+
+    if size in ["100k", "1m"]:
+        raise ValueError(
+            f"The {size} dataset does not include a links.csv file. "
+            "Please use '10m', '20m', or 'latest-small' instead."
+        )
+
+    # Define the links file path for each dataset size
+    # Note: Only 10m, 20m, and latest-small datasets contain links.csv
+    links_paths = {
+        "10m": "ml-10M100K/links.csv",
+        "20m": "ml-20m/links.csv",
+        "latest-small": "ml-latest-small/links.csv",
+    }
+
+    with download_path(local_cache_path) as path:
+        filepath = os.path.join(path, "ml-{}.zip".format(size))
+        dirs, _ = os.path.split(filepath)
+
+        # Download and extract if needed
+        if not os.path.exists(filepath):
+            download_movielens(size, filepath)
+
+        # Extract links file from zip
+        _, links_filename = os.path.split(links_paths[size])
+        links_datapath = os.path.join(dirs, links_filename)
+
+        if not os.path.exists(links_datapath):
+            with ZipFile(filepath, "r") as z:
+                try:
+                    with z.open(links_paths[size]) as zf, open(
+                        links_datapath, "wb"
+                    ) as f:
+                        shutil.copyfileobj(zf, f)
+                except KeyError:
+                    raise FileNotFoundError(
+                        f"links.csv not found in the {size} dataset archive. "
+                        f"Expected path: {links_paths[size]}"
+                    )
+
+        # Load the links data
+        links_df = pd.read_csv(
+            links_datapath,
+            sep=",",
+            engine="python",
+            header=0,  # links.csv files have headers
+            encoding="utf-8",
+        )
+
+        # Convert tmdbId to int (using Int64 nullable integer type to handle NaN values)
+        if "tmdbId" in links_df.columns:
+            links_df["tmdbId"] = links_df["tmdbId"].astype("Int64")
+
+        # Rename columns if custom names provided
+        column_mapping = {}
+        if movie_col != "movieId" and "movieId" in links_df.columns:
+            column_mapping["movieId"] = movie_col
+        if imdb_col and imdb_col != "imdbId" and "imdbId" in links_df.columns:
+            column_mapping["imdbId"] = imdb_col
+        if tmdb_col and tmdb_col != "tmdbId" and "tmdbId" in links_df.columns:
+            column_mapping["tmdbId"] = tmdb_col
+
+        if column_mapping:
+            links_df.rename(columns=column_mapping, inplace=True)
+
+        # Filter columns based on what user wants
+        cols_to_keep = [movie_col]
+        if imdb_col:
+            cols_to_keep.append(imdb_col)
+        if tmdb_col:
+            cols_to_keep.append(tmdb_col)
+
+        links_df = links_df[cols_to_keep]
+
+    return links_df
 
 
 def _load_item_df(size, item_datapath, movie_col, title_col, genres_col, year_col):
@@ -372,7 +500,7 @@ def load_spark_df(
 
     Args:
         spark (pyspark.SparkSession): Spark session.
-        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "mock100").
+        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "latest-small", "mock100").
         header (list or tuple): Rating dataset header.
             If `schema` is provided or `size` is set to any of 'MOCK_DATA_FORMAT', this argument is ignored.
         schema (pyspark.StructType): Dataset schema.
@@ -525,7 +653,9 @@ def _get_schema(header, schema):
 
 
 def _maybe_download_and_extract(size, dest_path):
-    """Downloads and extracts MovieLens rating and item datafiles if they don’t already exist"""
+    """
+    Downloads and extracts MovieLens rating and item datafiles if they don't already exist
+    """
     dirs, _ = os.path.split(dest_path)
     if not os.path.exists(dirs):
         os.makedirs(dirs)
@@ -546,7 +676,7 @@ def download_movielens(size, dest_path):
     """Downloads MovieLens datafile.
 
     Args:
-        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m").
+        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "latest-small").
         dest_path (str): File path for the downloaded file
     """
     if size not in DATA_FORMAT:
@@ -564,7 +694,7 @@ def extract_movielens(size, rating_path, item_path, zip_path):
     use ZipFile's extractall(path) instead.
 
     Args:
-        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m").
+        size (str): Size of the data to load. One of ("100k", "1m", "10m", "20m", "latest-small").
         rating_path (str): Destination path for rating datafile
         item_path (str): Destination path for item datafile
         zip_path (str): zipfile path
